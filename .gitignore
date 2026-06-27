@@ -1,0 +1,12 @@
+ViPE_models/
+outputs/
+*.mp4
+*.tar.gz
+*.pth
+*.pt
+*.safetensors
+__pycache__/
+*.pyc
+.cache/
+.DS_Store
+.upstream_git_backups/

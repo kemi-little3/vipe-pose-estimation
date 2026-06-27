@@ -1,0 +1,5 @@
+Upstream ViPE repository:
+https://github.com/nv-tlabs/vipe.git
+
+Imported commit:
+b7cac64616763bc755009db79a1815c7cdc9b130

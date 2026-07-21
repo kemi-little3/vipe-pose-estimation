@@ -41,6 +41,12 @@ def _default_vipe_repo() -> str:
 
 
 DEFAULT_VIPE_REPO = os.environ.get("VIPE_REPO", _default_vipe_repo())
+DEFAULT_VIPE_MODEL_ROOT = Path(
+    os.environ.get(
+        "VIPE_MODEL_ROOT",
+        "/mlp-01/duanmengxuan/data_pipeline/vipe/models",
+    )
+)
 # When 1 (default) skip the dense depth alignment post-step, which is unused
 # downstream — saves ~30-50% wall time per window. Set to 0 to fall back to the
 # original `vipe infer` invocation.
@@ -93,15 +99,23 @@ def run_vipe(clip_dir: Path, output_dir: Path, vipe_cmd: str = DEFAULT_VIPE_CMD)
     clip_dir = Path(clip_dir).resolve()
     output_dir = Path(output_dir).resolve()
 
+    total_started = time.perf_counter()
+    timings: dict[str, float] = {}
+    started = time.perf_counter()
     with (clip_dir / "meta.json").open() as f:
         meta = json.load(f)
     wanted = np.load(clip_dir / "frame_indices.npy").astype(np.int32)
     timestamps = np.load(clip_dir / "timestamps.npy")
     orig_w, orig_h = meta["original_resolution"]
+    timings["read_input_s"] = time.perf_counter() - started
 
-    started = time.time()
     with tempfile.TemporaryDirectory(prefix="vipe_out_") as tmpdir:
         tmp = Path(tmpdir)
+        started = time.perf_counter()
+        env = os.environ.copy()
+        env.setdefault("VIPE_MODEL_ROOT", str(DEFAULT_VIPE_MODEL_ROOT))
+        env.setdefault("TORCH_HOME", str(DEFAULT_VIPE_MODEL_ROOT / "torch"))
+        env.setdefault("HF_HOME", str(DEFAULT_VIPE_MODEL_ROOT / "huggingface"))
         if USE_RUN_PY:
             # Drive ViPE via run.py with a hydra override that disables the dense
             # depth post-alignment step (we only consume pose+intrinsics, never
@@ -121,13 +135,17 @@ def run_vipe(clip_dir: Path, output_dir: Path, vipe_cmd: str = DEFAULT_VIPE_CMD)
                 ],
                 check=True,
                 cwd=DEFAULT_VIPE_REPO,
+                env=env,
             )
         else:
             subprocess.run(
                 [vipe_cmd, "infer", str(clip_dir / "clip.mp4"), "--output", str(tmp)],
                 check=True,
+                env=env,
             )
+        timings["external_run_s"] = time.perf_counter() - started
 
+        started = time.perf_counter()
         pose_npz = _find_artifact(tmp, "pose", ".npz")
         intr_npz = _find_artifact(tmp, "intrinsics", ".npz")
 
@@ -137,7 +155,9 @@ def run_vipe(clip_dir: Path, output_dir: Path, vipe_cmd: str = DEFAULT_VIPE_CMD)
         pose_inds = pose_data["inds"]         # [N] int
         intr_all = intr_data["data"]          # [N, 4] fx, fy, cx, cy
         intr_inds = intr_data["inds"]
+        timings["load_artifacts_s"] = time.perf_counter() - started
 
+    started = time.perf_counter()
     pose_sel, pose_fallback = _select_rows_by_indices(pose_all, pose_inds, wanted)
     intr_sel, intr_fallback = _select_rows_by_indices(intr_all, intr_inds, wanted)
 
@@ -152,6 +172,7 @@ def run_vipe(clip_dir: Path, output_dir: Path, vipe_cmd: str = DEFAULT_VIPE_CMD)
         warnings.append(f"vipe pose nearest-neighbour fallback at {len(pose_fallback)} positions")
     if intr_fallback:
         warnings.append(f"vipe intrinsics nearest-neighbour fallback at {len(intr_fallback)} positions")
+    timings["postprocess_s"] = time.perf_counter() - started
 
     quality = {
         "method": "vipe",
@@ -169,10 +190,15 @@ def run_vipe(clip_dir: Path, output_dir: Path, vipe_cmd: str = DEFAULT_VIPE_CMD)
         "frame_source_fps": meta["sampled_fps"],
         "original_fps": meta["original_fps"],
         "t_meaning": "sampled_frames",
-        "elapsed_s": time.time() - started,
+        "elapsed_s": 0.0,
+        "timings": timings,
         "warnings": warnings,
     }
 
+    timings["total_before_save_s"] = time.perf_counter() - total_started
+    quality["elapsed_s"] = timings["total_before_save_s"]
+
+    started = time.perf_counter()
     save(output_dir, UnifiedOutput(
         intrinsics=intr_sel.astype(np.float32),
         poses_c2w=poses_c2w,
@@ -183,3 +209,8 @@ def run_vipe(clip_dir: Path, output_dir: Path, vipe_cmd: str = DEFAULT_VIPE_CMD)
         timestamps=timestamps,
         quality=quality,
     ))
+    timings["save_s"] = time.perf_counter() - started
+    timings["total_s"] = time.perf_counter() - total_started
+    quality["elapsed_s"] = timings["total_s"]
+    quality["timings"] = timings
+    (output_dir / "quality.json").write_text(json.dumps(quality, indent=2) + "\n")

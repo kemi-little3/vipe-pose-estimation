@@ -54,9 +54,11 @@ def run_vipe_on_4fps_mp4(clip_dir: Path, output_dir: Path, tmp_mp4: Path) -> Non
     wanted = np.arange(T, dtype=np.int32)
 
     env = os.environ.copy()
+    vipe_model_root = Path(os.environ.get('VIPE_MODEL_ROOT', '/mlp-01/duanmengxuan/data_pipeline/vipe/models'))
     env.update({
-        'TORCH_HOME': str(BASE / 'ViPE_models' / 'torch'),
-        'HF_HOME': str(BASE / 'ViPE_models' / 'huggingface'),
+        'VIPE_MODEL_ROOT': str(vipe_model_root),
+        'TORCH_HOME': str(vipe_model_root / 'torch'),
+        'HF_HOME': str(vipe_model_root / 'huggingface'),
     })
     started = time.time()
     with tempfile.TemporaryDirectory(prefix='vipe_out_') as vipe_tmp:

@@ -19,10 +19,27 @@ from ..geometry import invert_se3_batch, normalize_max_translation, relative_to_
 from ..schema import UnifiedOutput, save
 
 
-MEGASAM_REPO = Path(os.environ.get("MEGASAM_REPO", "/data1/duanmengxuan/projects/kemi/MegaSam/mega-sam"))
-MEGASAM_PYTHON = os.environ.get("MEGASAM_PYTHON", "/data1/duanmengxuan/envs/conda_envs/mega_sam/bin/python")
-MEGASAM_GPU_ID = os.environ.get("MEGASAM_GPU_ID", "1")
+PROJECT_ROOT = Path(__file__).resolve().parents[5]
+DEFAULT_MEGASAM_REPO = PROJECT_ROOT / "mega-sam" / "mega-sam"
+DEFAULT_MEGASAM_PYTHON = PROJECT_ROOT / "conda_envs" / "SKfP-megasam" / "bin" / "python"
+DEFAULT_TORCHHUB_DIR = PROJECT_ROOT / "models" / "torchhub"
+DEFAULT_HF_HOME = PROJECT_ROOT / "models" / "huggingface"
+
+MEGASAM_REPO = Path(os.environ.get("MEGASAM_REPO", str(DEFAULT_MEGASAM_REPO)))
+MEGASAM_PYTHON = os.environ.get("MEGASAM_PYTHON", str(DEFAULT_MEGASAM_PYTHON))
+MEGASAM_GPU_ID = os.environ.get("MEGASAM_GPU_ID", "0")
 MEGASAM_WORK_ROOT = Path(os.environ.get("MEGASAM_WORK_ROOT", "/tmp/megasam_adapter_runs"))
+
+
+def _render_keyframe_select_expr(frame_indices: list[int] | np.ndarray) -> str:
+    indices = [int(i) for i in frame_indices]
+    if not indices:
+        raise ValueError("MegaSaM keyframe_indices must not be empty")
+    if any(i < 0 for i in indices):
+        raise ValueError(f"MegaSaM keyframe_indices must be non-negative: {indices}")
+    if any(b <= a for a, b in zip(indices, indices[1:])):
+        raise ValueError(f"MegaSaM keyframe_indices must be strictly increasing: {indices}")
+    return "+".join(f"eq(n\\,{i})" for i in indices)
 
 
 def _scene_name(clip_dir: Path) -> str:
@@ -83,76 +100,28 @@ def _prepare_workdir(scene: str) -> Path:
 
     for name in ["data", "outputs", "reconstructions"]:
         (root / name).mkdir(parents=True, exist_ok=True)
-    _symlink_force(Path("/data1/duanmengxuan/cache/torch/hub"), root / "torchhub")
+    _symlink_force(DEFAULT_TORCHHUB_DIR, root / "torchhub")
 
     return root
 
 
-def run_megasam(clip_dir: Path, output_dir: Path) -> None:
-    clip_dir = Path(clip_dir).resolve()
-    output_dir = Path(output_dir).resolve()
-
-    with (clip_dir / "meta.json").open() as f:
-        meta = json.load(f)
-    wanted_all = np.load(clip_dir / "frame_indices.npy").astype(np.int32)
-    timestamps_all = np.load(clip_dir / "timestamps.npy")
-    orig_w, orig_h = meta["original_resolution"]
-    num_raw = meta.get("num_raw_frames")
-    is_full_frame = (
-        num_raw is not None
-        and len(wanted_all) == int(num_raw)
-        and np.array_equal(wanted_all, np.arange(int(num_raw), dtype=np.int32))
-    )
-    frame_mode = os.environ.get("MEGASAM_FRAME_MODE", "all" if is_full_frame else "fps")
-    fps = str(os.environ.get("MEGASAM_FPS", meta.get("sampled_fps", 10)))
-
-    scene = os.environ.get("MEGASAM_SCENE_NAME", _scene_name(clip_dir))
-
-    if not MEGASAM_REPO.exists():
-        raise FileNotFoundError(f"Mega-SaM repo not found: {MEGASAM_REPO}")
-
-    started = time.time()
-    workdir = _prepare_workdir(scene)
-    npz_path = workdir / "outputs" / f"{scene}_droid.npz"
-    env = os.environ.copy()
-    env.update({
-        "PYTHON_BIN": MEGASAM_PYTHON,
-        "GPU_ID": MEGASAM_GPU_ID,
-        "SCENE_NAME": scene,
-        "VIDEO_PATH": str(clip_dir / "clip.mp4"),
-        "FRAME_MODE": frame_mode,
-        "FPS": fps,
-        "TORCH_HOME": env.get("TORCH_HOME", "/data1/duanmengxuan/cache/torch"),
-        "HF_HOME": env.get("HF_HOME", "/data1/duanmengxuan/cache/huggingface"),
-        "HF_HUB_OFFLINE": env.get("HF_HUB_OFFLINE", "1"),
-    })
-    subprocess.run(
-        [
-            "bash",
-            "-lc",
-            """
+def _build_run_script() -> str:
+    return """
 set -euo pipefail
 echo "[MegaSaM] root: ${PWD}"
 echo "[MegaSaM] scene: ${SCENE_NAME}"
 echo "[MegaSaM] video: ${VIDEO_PATH}"
 echo "[MegaSaM] gpu: ${GPU_ID}"
-echo "[MegaSaM] frame mode: ${FRAME_MODE}"
+echo "[MegaSaM] keyframe list: megasam_keyframe_indices.txt"
 
 FRAME_DIR="data/${SCENE_NAME}"
 DA_OUT="Depth-Anything/video_visualization/${SCENE_NAME}"
 UNI_OUT="UniDepth/outputs"
-VIS_DIR="outputs/${SCENE_NAME}_vis"
 mkdir -p "${FRAME_DIR}"
 
-if [ "${FRAME_MODE}" = "all" ]; then
-  ffmpeg -y -i "${VIDEO_PATH}" "${FRAME_DIR}/%05d.jpg"
-elif [ "${FRAME_MODE}" = "fps" ]; then
-  ffmpeg -y -i "${VIDEO_PATH}" -vf "fps=${FPS}" "${FRAME_DIR}/%05d.jpg"
-else
-  echo "FRAME_MODE must be 'all' or 'fps'" >&2
-  exit 2
-fi
+ffmpeg -y -i "${VIDEO_PATH}" -vf "select=${KEYFRAME_EXPR}" -vsync 0 "${FRAME_DIR}/%05d.jpg"
 
+echo "[MegaSaM] requested keyframes: $(wc -l < megasam_keyframe_indices.txt)"
 echo "[MegaSaM] frames: $(find "${FRAME_DIR}" -maxdepth 1 -type f \\( -name '*.jpg' -o -name '*.png' \\) | wc -l)"
 
 CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" \
@@ -177,13 +146,61 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" \
   --mono_depth_path "${PWD}/Depth-Anything/video_visualization" \
   --metric_depth_path "${PWD}/UniDepth/outputs" \
   --disable_vis
-""",
+"""
+
+
+def run_megasam(clip_dir: Path, output_dir: Path) -> None:
+    clip_dir = Path(clip_dir).resolve()
+    output_dir = Path(output_dir).resolve()
+
+    total_started = time.perf_counter()
+    timings: dict[str, float] = {}
+    started = time.perf_counter()
+    with (clip_dir / "meta.json").open() as f:
+        meta = json.load(f)
+    wanted_all = np.load(clip_dir / "frame_indices.npy").astype(np.int32)
+    timestamps_all = np.load(clip_dir / "timestamps.npy")
+    orig_w, orig_h = meta["original_resolution"]
+    keyframe_expr = _render_keyframe_select_expr(wanted_all)
+    timings["read_input_s"] = time.perf_counter() - started
+
+    scene = os.environ.get("MEGASAM_SCENE_NAME", _scene_name(clip_dir))
+
+    if not MEGASAM_REPO.exists():
+        raise FileNotFoundError(f"Mega-SaM repo not found: {MEGASAM_REPO}")
+
+    started = time.perf_counter()
+    workdir = _prepare_workdir(scene)
+    (workdir / "megasam_keyframe_indices.txt").write_text(
+        "\n".join(str(int(i)) for i in wanted_all) + "\n"
+    )
+    timings["prepare_workdir_s"] = time.perf_counter() - started
+    npz_path = workdir / "outputs" / f"{scene}_droid.npz"
+    env = os.environ.copy()
+    env.update({
+        "PYTHON_BIN": MEGASAM_PYTHON,
+        "GPU_ID": MEGASAM_GPU_ID,
+        "SCENE_NAME": scene,
+        "VIDEO_PATH": str(clip_dir / "clip.mp4"),
+        "KEYFRAME_EXPR": keyframe_expr,
+        "TORCH_HOME": str(DEFAULT_TORCHHUB_DIR.parent),
+        "HF_HOME": str(DEFAULT_HF_HOME),
+        "HF_HUB_OFFLINE": env.get("HF_HUB_OFFLINE", "1"),
+    })
+    started = time.perf_counter()
+    subprocess.run(
+        [
+            "bash",
+            "-lc",
+            _build_run_script(),
         ],
         cwd=str(workdir),
         env=env,
         check=True,
     )
+    timings["external_run_s"] = time.perf_counter() - started
 
+    started = time.perf_counter()
     if not npz_path.exists():
         raise FileNotFoundError(f"Mega-SaM did not produce {npz_path}")
 
@@ -191,19 +208,21 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" \
     poses_c2w_all = data["cam_c2w"].astype(np.float64)
     images = data["images"]
     K = data["intrinsic"].astype(np.float64)
+    timings["load_artifacts_s"] = time.perf_counter() - started
 
+    started = time.perf_counter()
     n = min(len(poses_c2w_all), len(wanted_all), len(timestamps_all))
     poses_c2w = poses_c2w_all[:n]
     wanted = wanted_all[:n]
     timestamps = timestamps_all[:n]
 
-    warnings: list[str] = [f"megasam_ran_frame_mode_{frame_mode}"]
-    if frame_mode == "fps":
-        warnings.append(f"megasam_fps_{fps}")
+    warnings: list[str] = ["megasam_keyframe_only"]
     status = "ok"
-    if n < len(wanted_all):
+    if len(poses_c2w_all) != len(wanted_all):
         status = "degraded"
-        warnings.append(f"megasam returned {n} frames; truncated adapter metadata to match")
+        warnings.append(
+            f"megasam returned {len(poses_c2w_all)} frames for {len(wanted_all)} requested keyframes; truncated to {n}"
+        )
     if n == 0:
         raise RuntimeError(f"Mega-SaM output contains no frames: {npz_path}")
 
@@ -213,11 +232,14 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" \
     poses_w2c = invert_se3_batch(poses_c2w)
     rel = relative_to_first(poses_c2w)
     rel_norm, scale_factor, total_path = normalize_max_translation(rel)
+    timings["postprocess_s"] = time.perf_counter() - started
 
+    started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_copy = output_dir / f"{scene}_droid.npz"
     if not raw_copy.exists():
         shutil.copy2(npz_path, raw_copy)
+    timings["copy_raw_s"] = time.perf_counter() - started
 
     quality = {
         "method": "megasam",
@@ -235,7 +257,8 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" \
         "frame_source_fps": meta["sampled_fps"],
         "original_fps": meta["original_fps"],
         "t_meaning": "sampled_frames",
-        "elapsed_s": time.time() - started,
+        "elapsed_s": 0.0,
+        "timings": timings,
         "warnings": warnings,
         "megasam_repo": str(MEGASAM_REPO),
         "megasam_workdir": str(workdir),
@@ -243,6 +266,10 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" \
         "megasam_raw_npz": str(npz_path),
     }
 
+    timings["total_before_save_s"] = time.perf_counter() - total_started
+    quality["elapsed_s"] = timings["total_before_save_s"]
+
+    started = time.perf_counter()
     save(output_dir, UnifiedOutput(
         intrinsics=intrinsics,
         poses_c2w=poses_c2w,
@@ -253,3 +280,8 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" \
         timestamps=timestamps,
         quality=quality,
     ))
+    timings["save_s"] = time.perf_counter() - started
+    timings["total_s"] = time.perf_counter() - total_started
+    quality["elapsed_s"] = timings["total_s"]
+    quality["timings"] = timings
+    (output_dir / "quality.json").write_text(json.dumps(quality, indent=2) + "\n")

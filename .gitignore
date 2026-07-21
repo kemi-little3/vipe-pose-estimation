@@ -10,3 +10,7 @@ __pycache__/
 .cache/
 .DS_Store
 .upstream_git_backups/
+
+# Local logs and large demo data
+logs/
+pose_demo/data/
